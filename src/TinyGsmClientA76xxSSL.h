@@ -144,6 +144,7 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
         client_private_key(),
         client_private_key_password() {
     memset(sockets, 0, sizeof(sockets));
+    memset(peer_closed, 0, sizeof(peer_closed));
   }
 
   /*
@@ -189,19 +190,15 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
   }
 
   void maintainImpl() {
-    // Keep listening for modem URC's and proactively iterate through
-    // sockets asking if any data is available
-    bool check_socks = false;
+    // Keep listening for modem URC's and ask about data for every socket
+    // that reported some, or whose periodic check in available() is due.
     for (int mux = 0; mux < TINY_GSM_MUX_COUNT; mux++) {
       GsmClientA76xxSSL* sock = sockets[mux];
       if (sock && sock->got_data) {
         sock->got_data = false;
-        check_socks    = true;
+        modemGetAvailable(mux);
       }
     }
-    // modemGetAvailable checks all socks, so we only want to do it once
-    // modemGetAvailable calls modemGetConnected(), which also checks allf
-    if (check_socks) { modemGetAvailable(0); }
     while (stream.available()) { waitResponse(15, NULL, NULL); }
   }
 
@@ -414,6 +411,7 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
  protected:
   bool sslConnect(const char* host, uint16_t port, uint8_t mux, bool ssl, int timeout_s) {
     uint32_t timeout_ms = ((uint32_t)timeout_s) * 1000;
+    peer_closed[mux]    = false;
 
     /*
     0 - The authentication mode, the default value is 0. no authentication.
@@ -577,13 +575,15 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
       return 0;
     }
 
-    for (int i = 0; i < len_confirmed; i++) {
+    // Stop at a gap instead of storing stream.read()'s -1 as data.
+    int16_t received = 0;
+    for (; received < len_confirmed; received++) {
       uint32_t startMillis = millis();
       while (!stream.available() && (millis() - startMillis < sockets[mux]->_timeout)) {
         TINY_GSM_YIELD();
       }
-      char c = stream.read();
-      sockets[mux]->rx.put(c);
+      if (!stream.available()) { break; }
+      sockets[mux]->rx.put(static_cast<char>(stream.read()));
     }
 
     if (waitResponse("+CCHRECV:") == 1) {
@@ -596,112 +596,63 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
     // the module is **EXTREMELY** testy about being asked to read more from
     // the buffer than exits; it will freeze until a hard reset or power cycle!
     sockets[mux]->sock_available = modemGetAvailable(mux);
-    return len_confirmed;
+    return received;
   }
 
   size_t sslAvailable(uint8_t mux) {
-    // If the socket doesn't exist, just return
     if (!sockets[mux]) { return 0; }
-    // We need to check if there are any connections open *before* checking for
-    // available characters.  The A76XX *will crash* if you ask about data
-    // when there are no open connections.
-    if (!modemGetConnected(mux)) { return 0; }
+    sslConnected(mux);
 
-    // NOTE: This gets how many characters are available on all connections that
-    // have data.  It does not return all the connections, just those with data.
+    // One cached length per session: +CCHRECV: LEN,<len0>,<len1>[,<len2>]
+    // Asked even for a closed session: on the A7672G (A110B06A7672M7) the data
+    // stays readable after +CCH_PEER_CLOSED, and the query does not crash it.
     sendAT(GF("+CCHRECV?"));
-    // +CCHRECV: LEN,2048,0
-    int res = waitResponse(3000, GF("+CCHRECV: LEN,"), GFP(GSM_OK), GFP(GSM_ERROR));
-    // if we get the +CCHRECV: response, read the mux number and the number of
-    // characters available
-    if (res == 1) {
-      // +CCHRECV: LEN,2048,0
-      size_t result  = streamGetIntBefore(',');
-      int    ret_mux = streamGetIntBefore('\n');
-      if (ret_mux == -9999) {
-        // DBG("ERROR: mux = -9999");
-        return 0;
-      }
-      GsmClientA76xxSSL* sock = sockets[ret_mux];
+    if (waitResponse(3000, GF("+CCHRECV: LEN,")) == 1) {
+      String lengths = stream.readStringUntil('\n');
       waitResponse();
-      // DBG("---- available:", result, "ret_mux", ret_mux);
-      if (sock) { sock->sock_available = result; }
+      int start = 0;
+      for (uint8_t session = 0;; session++) {
+        int comma = lengths.indexOf(',', start);
+        String field = comma < 0 ? lengths.substring(start) : lengths.substring(start, comma);
+        if (session < TINY_GSM_MUX_COUNT && sockets[session]) {
+          sockets[session]->sock_available = field.toInt();
+        }
+        if (comma < 0) { break; }
+        start = comma + 1;
+      }
     }
-    if (!sockets[mux]) { return 0; }
-    // DBG("sockets[mux]->sock_available=", sockets[mux]->sock_available);
     return sockets[mux]->sock_available;
   }
 
-  /*
-   * The following versions are known to have bugs:
-   * Model: A7670E-FASE
-   * - A7670M7_B02V03_210922
-   * - A7670M7_B07V01_240927
-   * - A7670M7_B05V04_240122
-   * Model: A7608SA-H
-   * - A7600M7_B11V05_231108
-   *
-   * Other versions may also have the same problem. BUG analysis has been submitted to
-   * SIMCOM 20241209
-   */
+  // One line per session: +CCHOPEN: <id>,"<host>",<port>,<type>,<bind_port>
+  // An idle session reads: +CCHOPEN: <id>,"",,,
   bool sslConnected(uint8_t mux) {
     sendAT(GF("+CCHOPEN?"));
-    // +CCHOPEN: 0,<host>,<port>,<client_type>,<bind_port>
-    // +CCHOPEN: 0,"httpbin.org",443,2,54021
-    int res = waitResponse(3000, GF("+CCHOPEN:"), GFP(GSM_OK), GFP(GSM_ERROR));
-    if (res == 1) {
-      bool connected = false;
-      // Response
-      // AT+CCHOPEN?
-      // +CCHOPEN: 0,"",,,
-      // +CCHOPEN: 1,"",,,
-      //
-      // OK
-      char buf[4] = {0};
-      int  ret_mux;
-      if (mux == 0) {
-        ret_mux = streamGetIntBefore(',');
-        streamGetLength(buf, 2);
-        if (buf[0] == '"' && buf[1] != '"') { connected = true; }
-        // Serial.printf("\n\n mux=%d [0]=%c 0x%x -- [1]=%c 0x%x Connected=%d\n", ret_mux,
-        //               buf[0], buf[0], buf[1], buf[1], connected);
-        waitResponse("\n");
-        if (mux == ret_mux) { sockets[mux]->sock_connected = connected; }
-      } else {
-        // Skip mux 0
-        waitResponse("\n");
+    while (waitResponse(3000, GF("+CCHOPEN: "), GFP(GSM_OK), GFP(GSM_ERROR)) == 1) {
+      int session = streamGetIntBefore(',');
+      String rest = stream.readStringUntil('\n');
+      if (session >= 0 && session < TINY_GSM_MUX_COUNT && sockets[session]) {
+        sockets[session]->sock_connected = !peer_closed[session] && rest.length() > 1 &&
+                                           rest[0] == '"' && rest[1] != '"';
       }
-
-      if (mux == 1) {
-        int8_t res = waitResponse(3000, GF("+CCHOPEN:"));
-        if (res == 1) {
-          buf[0]  = '0';
-          buf[1]  = '0';
-          ret_mux = streamGetIntBefore(',');
-          streamGetLength(buf, 2);
-          if (buf[0] == '"' && buf[1] != '"') { connected = true; }
-          // Serial.printf("\n\n mux=%d [0]=%c 0x%x -- [1]=%c 0x%x Connected=%d\n",
-          // ret_mux,buf[0], buf[0], buf[1], buf[1], connected);
-          if (mux == ret_mux) { sockets[mux]->sock_connected = connected; }
-        }
-      }
-
-      // Wait OK
-      waitResponse();
-    } else {
-      DBG("## Unhandle");
     }
-    // DBG("Connect = ", sockets[mux]->sock_connected);
-    return sockets[mux]->sock_connected;
+    return sockets[mux] && sockets[mux]->sock_connected;
   }
 
   bool sslDisconnect(uint8_t mux) {
+    if (sockets[mux]) { sockets[mux]->sock_connected = false; }
     sendAT(GF("+CCHCLOSE="), mux);
-    waitResponse(3000);
-    waitResponse(3000UL,GF("+CCHCLOSE:"),GF("ERROR"));
-    streamSkipUntil('\n');
+    // ERROR when the peer already closed the session.
+    if (waitResponse(3000UL) == 1) {
+      waitResponse(3000UL, GF("+CCHCLOSE:"));
+      streamSkipUntil('\n');
+    }
+    // AT+CCHSTOP ends every session, so only stop when none is left open.
+    for (int i = 0; i < TINY_GSM_MUX_COUNT; i++) {
+      if (sockets[i] && sockets[i]->sock_connected) { return true; }
+    }
     sendAT(GF("+CCHSTOP"));
-    waitResponse(3000UL,GF("+CCHSTOP:"),GF("ERROR"));
+    waitResponse(3000UL, GF("+CCHSTOP:"), GF("ERROR"));
     streamSkipUntil('\n');
     return true;
   }
@@ -924,13 +875,18 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
         } else if (data.endsWith(GF("SIM REMOVED"))) {
           data = "";
           // TODO:
-        } else if (data.endsWith(GF("+CCHEVENT: 0,RECV EVENT"))) {
+        } else if (data.endsWith(GF("+CCHEVENT:"))) {
+          int8_t mux = streamGetIntBefore(',');
+          streamSkipUntil('\n');
+          if (mux >= 0 && mux < TINY_GSM_MUX_COUNT && sockets[mux]) {
+            sockets[mux]->got_data = true;
+          }
           data = "";
-          // TODO:
         } else if (data.endsWith(GF("+CCH_PEER_CLOSED:"))) {
           int8_t mux = streamGetIntBefore('\n');
           if (mux >= 0 && mux < TINY_GSM_MUX_COUNT && sockets[mux]) {
             sockets[mux]->sock_connected = false;
+            peer_closed[mux]             = true;
             DBG("### Closed: ", mux);
           }
           data = "";
@@ -1009,6 +965,8 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
   String             client_certificate[TINY_GSM_MUX_COUNT];
   String             client_private_key_password[TINY_GSM_MUX_COUNT];
   GsmClientConnType  connType[TINY_GSM_MUX_COUNT];
+  // AT+CCHOPEN? can still list a session the server has closed.
+  bool               peer_closed[TINY_GSM_MUX_COUNT];
   size_t             websocket_available_bytes;
   websocket_cb_t     _websocket_cb;
 };
