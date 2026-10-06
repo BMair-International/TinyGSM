@@ -190,8 +190,9 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
   }
 
   void maintainImpl() {
-    // Keep listening for modem URC's and ask about data for every socket
-    // that reported some, or whose periodic check in available() is due.
+    // Handle URC's first: a +CCHEVENT or +CCH_PEER_CLOSED flags the socket,
+    // and the lengths are then asked in this same pass.
+    while (stream.available()) { waitResponse(15, NULL, NULL); }
     for (int mux = 0; mux < TINY_GSM_MUX_COUNT; mux++) {
       GsmClientA76xxSSL* sock = sockets[mux];
       if (sock && sock->got_data) {
@@ -199,7 +200,6 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
         modemGetAvailable(mux);
       }
     }
-    while (stream.available()) { waitResponse(15, NULL, NULL); }
   }
 
   /*
@@ -585,6 +585,9 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
       if (!stream.available()) { break; }
       sockets[mux]->rx.put(static_cast<char>(stream.read()));
     }
+    if (received < len_confirmed) {
+      log_e("+CCHRECV short read on session %d: %d of %d bytes", mux, received, len_confirmed);
+    }
 
     if (waitResponse("+CCHRECV:") == 1) {
       ret_mux = streamGetIntBefore(',');
@@ -595,33 +598,36 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
     // make sure the sock available number is accurate again
     // the module is **EXTREMELY** testy about being asked to read more from
     // the buffer than exits; it will freeze until a hard reset or power cycle!
-    sockets[mux]->sock_available = modemGetAvailable(mux);
+    // Only the lengths: the connection state is not needed between chunks.
+    sslUpdateAvailable();
     return received;
   }
 
   size_t sslAvailable(uint8_t mux) {
     if (!sockets[mux]) { return 0; }
     sslConnected(mux);
-
-    // One cached length per session: +CCHRECV: LEN,<len0>,<len1>[,<len2>]
-    // Asked even for a closed session: on the A7672G (A110B06A7672M7) the data
-    // stays readable after +CCH_PEER_CLOSED, and the query does not crash it.
-    sendAT(GF("+CCHRECV?"));
-    if (waitResponse(3000, GF("+CCHRECV: LEN,")) == 1) {
-      String lengths = stream.readStringUntil('\n');
-      waitResponse();
-      int start = 0;
-      for (uint8_t session = 0;; session++) {
-        int comma = lengths.indexOf(',', start);
-        String field = comma < 0 ? lengths.substring(start) : lengths.substring(start, comma);
-        if (session < TINY_GSM_MUX_COUNT && sockets[session]) {
-          sockets[session]->sock_available = field.toInt();
-        }
-        if (comma < 0) { break; }
-        start = comma + 1;
-      }
-    }
+    sslUpdateAvailable();
     return sockets[mux]->sock_available;
+  }
+
+  // One cached length per session: +CCHRECV: LEN,<len0>,<len1>[,<len2>]
+  // Asked even for a closed session: on the A7672G (A110B06A7672M7) the data
+  // stays readable after +CCH_PEER_CLOSED, and the query does not crash it.
+  void sslUpdateAvailable() {
+    sendAT(GF("+CCHRECV?"));
+    if (waitResponse(3000, GF("+CCHRECV: LEN,")) != 1) { return; }
+    String lengths = stream.readStringUntil('\n');
+    waitResponse();
+    int start = 0;
+    for (uint8_t session = 0;; session++) {
+      int comma = lengths.indexOf(',', start);
+      String field = comma < 0 ? lengths.substring(start) : lengths.substring(start, comma);
+      if (session < TINY_GSM_MUX_COUNT && sockets[session]) {
+        sockets[session]->sock_available = field.toInt();
+      }
+      if (comma < 0) { break; }
+      start = comma + 1;
+    }
   }
 
   // One line per session: +CCHOPEN: <id>,"<host>",<port>,<type>,<bind_port>
@@ -887,6 +893,8 @@ class TinyGsmA76xxSSL : public TinyGsmA76xx<TinyGsmA76xxSSL>,
           if (mux >= 0 && mux < TINY_GSM_MUX_COUNT && sockets[mux]) {
             sockets[mux]->sock_connected = false;
             peer_closed[mux]             = true;
+            // The server may have sent more data just before closing.
+            sockets[mux]->got_data = true;
             DBG("### Closed: ", mux);
           }
           data = "";
